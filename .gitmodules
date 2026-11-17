@@ -1,3 +1,6 @@
 [submodule ".devcontainer/ros2docker"]
 	path = .devcontainer/ros2docker
 	url = git@github.com:DavideCapuzz/ros2docker.git
+[submodule "robots/so101/ros2_ws/src/so101_ros2"]
+	path = robots/so101/ros2_ws/src/so101_ros2
+	url = https://github.com/adoodevv/so101_ros2.git

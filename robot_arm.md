@@ -1,1816 +1,1656 @@
+I'll rebuild the setup as a complete, copy-and-paste implementation, using the actual upstream `ros2docker` files as the starting point.
 
-# SO101\_Gazebo\_Project.md
+This version will distinguish between:
 
-**Project:** Multi-robot SO-101 manipulation simulation\
-**Host:** Ubuntu 24.04 + NVIDIA GPU\
-**ROS 2:** Jazzy\
-**Simulator:** Gazebo Harmonic\
-**Robot:** LeRobot SO-101\
-**Architecture:** Two Docker containers\
-**Environment:** Dynamically generated from configuration files
+- **Unchanged upstream files:** no need to replace them.
+- **Modified ros2docker files:** complete replacement contents.
+- **New project files:** complete contents and exact paths.
+- **Downloaded files:** commands to retrieve the original SO-101 description and dependencies.
 
----
+I'm also correcting an important issue in the previous version: the original SO-101 URDF contains transmissions, but those transmissions do not automatically create Gazebo controllers. The first implementation will spawn the original model without claiming that simulated joint control is already working.
 
-# 1\. Project objectives
+### Decisions retained
 
-Build a robotics development environment with:
+- Two containers: `gazebo` and `robot1`.
+- Ubuntu 24.04 and ROS 2 Jazzy.
+- Gazebo Harmonic.
+- Original TheRobotStudio SO-101 model.
+- URDF-to-SDF conversion at runtime.
+- `ros_gz_bridge` inside `robot1`.
+- Gazebo Transport between containers.
+- Original `/home/ubuntu/ros2_ws` naming convention.
+- Existing ros2docker generator and volume-generation architecture.
+- No custom Dockerfile unless absolutely necessary.
 
-1. One container dedicated exclusively to Gazebo.
-2. One container containing ROS 2, LeRobot and SO-101 interfaces.
-3. Direct Gazebo Transport communication between containers.
-4. No ROS 2 installation in the Gazebo container.
-5. Multiple SO-101 robots in one simulation.
-6. Support for simulated and physical SO-101 robots.
-7. Dynamic environment generation.
-8. Configurable tables, objects, cameras and robot positions.
-9. NVIDIA GPU support.
-10. Integration with MoveIt 2 and RViz2.
-11. Dataset recording for LeRobot.
+# SO-101 Multicontainer — corrected implementation
 
-The project should extend the existing ros2docker repository rather than replace its architecture.
+## 1\. What changes compared with the previous version?
 
-Original repositories:
+I'm making one important architectural improvement: **we won't replace the ros2docker Compose generator.**
 
-- https://github.com/DavideCapuzz/ros2docker
-- https://github.com/DavideCapuzz/multibot
+Instead, we will:
 
----
+- Keep `init_docker-compose.sh` unchanged.
+- Keep the original Dockerfile and entrypoint.
+- Fix `init_setup.sh` so errors stop generation and fallback directories exist.
+- Add a small Python script that adjusts the generated Compose file.
+- Preserve the generator's named-volume definitions.
+- Keep all SO-101-specific configuration outside the ros2docker submodule.
 
-# 2\. Architecture
+This means the project-specific changes are modular and can be removed without rewriting ros2docker.
+
+The upstream generator currently creates the same `src` and `launch` mounts for every service, then generates named volumes separately. Our post-processing step changes only the service-level mounts and preserves the top-level volume definitions.  GitHub
+
+The original SO-101 repository provides the URDF and mesh assets in the `Simulation/SO101` directory. We will use those files directly.  GitHub+1
+
+## 2\. Final architecture
 
 text
 
 ```text
-                 UBUNTU 24.04 HOST
-                   NVIDIA GPU
-                        |
-                        |
-                  DOCKER COMPOSE
-                        |
-             +----------+----------+
-             |                     |
-             v                     v
-     GAZEBO CONTAINER       SO101 CONTAINER
-             |                     |
-     Ubuntu 24.04           Ubuntu 24.04
-     Gazebo Harmonic        ROS 2 Jazzy
-                            LeRobot
-     Physics                MoveIt 2
-     World                  RViz2
-     Objects                ros2_control
-     Robot models           SO-101 interface
-     Gazebo plugins         PyTorch
-             |                     |
-             |                     |
-             +---------------------+
-                 GAZEBO TRANSPORT
-                   TCP / UDP
+UBUNTU 24.04 HOST
+       |
+       | NVIDIA GPU
+       |
+       v
+  DOCKER COMPOSE
+       |
+       +--------------------------+
+       |                          |
+       v                          v
+   GAZEBO                    ROBOT1
+   CONTAINER                 CONTAINER
+   ---------                 ---------
+   Ubuntu 24.04              Ubuntu 24.04
+   ROS 2 Jazzy               ROS 2 Jazzy
+   Gazebo Harmonic           RViz2
+   Physics                   MoveIt 2
+   World                     ros2_control
+   Robot simulation          ros_gz_bridge
+                             LeRobot
+                             PyTorch
+                             SO-101 workspace
+       |                          |
+       |                          |
+       +--------------------------+
+                 |
+                 v
+          GAZEBO TRANSPORT
+             TCP / UDP
 ```
 
-## Communication principle
+Communication:
 
-Gazebo and ROS 2 use different communication systems.
+| Communication | Protocol |
+| --- | --- |
+| Robot1 → Gazebo | Gazebo Transport |
+| Gazebo → Robot1 | Gazebo Transport |
+| Bridge → ROS nodes | ROS 2 DDS, inside robot1 |
+| Robot1 → other future robots | ROS 2 DDS, configurable |
 
-Gazebo uses Gazebo Transport.
+The containers will have different `ROS_DOMAIN_ID` values. The bridge is the only component that connects ROS messages to Gazebo Transport.
 
-ROS 2 uses DDS.
-
-The SO-101 hardware interface connects directly to Gazebo Transport and exposes standard ROS 2 hardware interfaces.
-
-text
-
-```text
-Gazebo
-  |
-  | Gazebo Transport
-  |
-  v
-Gazebo Transport Client
-  |
-  v
-SO101SystemInterface (C++)
-  |
-  v
-ROS 2 Controller Manager
-  |
-  +------------------+
-  |                  |
-  v                  v
-LeRobot            MoveIt 2
-```
-
-The Gazebo container does not require ROS 2.
-
-Each robot must have its own namespace and Gazebo topic prefix.
+**Important:** Gazebo Transport discovery across Docker bridge networks must be tested. Sharing a network and `GZ_PARTITION` does not automatically guarantee multicast discovery.
 
 ---
 
-# 3\. Project directory structure
+## 3\. Final project structure
 
 text
 
 ```text
-so101_ros2docker/
+lerobot_multibot/
 │
-├── README.md
-├── docker-compose.yml
-├── .env
+├── .devcontainer/
+│   │
+│   ├── ros2docker/                 # Existing Git submodule
+│   │
+│   ├── setup.ini                   # Two-container configuration
+│   ├── install_robot_deps.sh       # Custom dependency profiles
+│   ├── generate_compose.sh         # Generation wrapper
+│   ├── patch_compose.py            # Compose postprocessor
+│   │
+│   ├── gazebo/
+│   │   └── endfunction.sh
+│   │
+│   └── robot1/
+│       └── endfunction.sh
 │
-├── ros2docker/
-│   ├── Dockerfile
-│   ├── setup.ini
-│   ├── template/
-│   │   ├── init_setup.sh
-│   │   └── install_robot_deps.sh
-│   └── scripts/
-│       ├── check_environment.sh
-│       └── test_profiles.sh
+├── simulation/
+│   └── worlds/
+│       └── warehouse.sdf
 │
-├── gazebo/
-│   ├── Dockerfile
-│   ├── entrypoint.sh
-│   │
-│   ├── worlds/
-│   │   └── table_world.sdf
-│   │
-│   ├── models/
-│   │   ├── table/
-│   │   └── so101/
-│   │
-│   └── plugins/
-│       └── so101_system/
-│           ├── CMakeLists.txt
-│           ├── include/
-│           └── src/
+├── robots/
+│   └── so101/
+│       │
+│       ├── description/
+│       │   └── original/
+│       │       └── SO-ARM100/
+│       │           └── Simulation/
+│       │               └── SO101/
+│       │                   ├── so101_new_calib.urdf
+│       │                   ├── so101_old_calib.urdf
+│       │                   ├── so101_new_calib.xml
+│       │                   ├── scene.xml
+│       │                   └── assets/
+│       │
+│       └── ros2_ws/
+│           │
+│           ├── src/
+│           │   └── so101_bringup/
+│           │       ├── CMakeLists.txt
+│           │       ├── package.xml
+│           │       ├── launch/
+│           │       │   └── simulation.launch.py
+│           │       └── config/
+│           │           └── gazebo_bridge.yaml
+│           │
+│           ├── build/
+│           ├── install/
+│           └── log/
 │
-├── so101/
-│   ├── Dockerfile
-│   ├── entrypoint.sh
-│   │
-│   ├── config/
-│   │   ├── environment.json
-│   │   ├── robots.yaml
-│   │   └── controllers.yaml
-│   │
-│   ├── ros2_ws/
-│   │   └── src/
-│   │       ├── so101_description/
-│   │       ├── so101_hardware/
-│   │       ├── so101_bringup/
-│   │       ├── so101_interfaces/
-│   │       └── so101_moveit_config/
-│   │
+├── data/
 │   └── lerobot/
-│       └── so101_gazebo/
-│           ├── robot.py
-│           ├── config.py
-│           └── cameras.py
 │
-├── tools/
-│   └── generate_world.py
-│
-├── scripts/
-│   ├── build.sh
-│   ├── start.sh
-│   ├── stop.sh
-│   ├── generate_world.sh
-│   ├── shell_gazebo.sh
-│   ├── shell_so101.sh
-│   └── test.sh
-│
-└── data/
-    ├── calibration/
-    ├── datasets/
-    └── checkpoints/
+├── .gitignore
+└── README.md
 ```
+
+Notice that:
+
+- The complete SO-101 workspace exists only in `robot1`.
+- Gazebo receives only the simulation world and robot description.
+- The original SO-101 model is not modified.
+- `build`, `install` and `log` are independent Docker volumes.
 
 ---
 
-# 4\. Docker configuration
+# PART A — Download and prepare the original model
 
-## 4.1 `.env`
-
-bash
-
-```bash
-ROS_DISTRO=jazzy
-GZ_VERSION=harmonic
-
-ROS_DOMAIN_ID=10
-GZ_PARTITION=so101_simulation
-
-GAZEBO_CONTAINER=gazebo_sim
-SO101_CONTAINER=so101_environment
-
-NVIDIA_VISIBLE_DEVICES=all
-NVIDIA_DRIVER_CAPABILITIES=all
-
-WORLD_NAME=table_world
-```
-
-## 4.2 `docker-compose.yml`
-
-yaml
-
-```yaml
-services:
-
-  gazebo:
-    build:
-      context: ./gazebo
-      dockerfile: Dockerfile
-
-    container_name: gazebo_sim
-
-    environment:
-      GZ_PARTITION: ${GZ_PARTITION}
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: all
-      DISPLAY: ${DISPLAY}
-
-    volumes:
-      - ./gazebo/worlds:/workspace/worlds
-      - ./gazebo/models:/workspace/models
-      - ./data:/data
-      - /tmp/.X11-unix:/tmp/.X11-unix
-
-    network_mode: host
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-    command:
-      - gz
-      - sim
-      - -r
-      - -v
-      - "4"
-      - /workspace/worlds/table_world.sdf
-
-  so101:
-    build:
-      context: ./so101
-      dockerfile: Dockerfile
-
-    container_name: so101_environment
-
-    environment:
-      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID}
-      GZ_PARTITION: ${GZ_PARTITION}
-      GZ_TRANSPORT_IP: ${GZ_TRANSPORT_IP:-127.0.0.1}
-
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: all
-
-    volumes:
-      - ./so101/ros2_ws:/workspace/ros2_ws
-      - ./so101/lerobot:/workspace/lerobot
-      - ./data:/data
-
-    network_mode: host
-
-    depends_on:
-      - gazebo
-
-    tty: true
-    stdin_open: true
-
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
-
-**Networking:** Host networking is used initially to simplify Gazebo Transport discovery. This also shares the host network namespace, so Gazebo and ROS 2 ports must be managed carefully. A later deployment can use an isolated network with explicitly configured Gazebo Transport discovery.
-
----
-
-# 5\. Gazebo Dockerfile
-
-File: `gazebo/Dockerfile`
-
-dockerfile
-
-```dockerfile
-FROM ubuntu:24.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
-    curl \
-    lsb-release \
-    gnupg \
-    wget \
-    git \
-    build-essential \
-    cmake \
-    libgl1 \
-    libegl1 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl -sSL https://packages.osrfoundation.org/gazebo.gpg \
-    -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg
-
-RUN echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable noble main" \
-    > /etc/apt/sources.list.d/gazebo-stable.list
-
-RUN apt-get update && apt-get install -y \
-    gz-harmonic \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV GZ_PARTITION=so101_simulation
-
-WORKDIR /workspace
-
-COPY entrypoint.sh /entrypoint.sh
-
-RUN chmod +x /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
-```
-
-## 5.1 `gazebo/entrypoint.sh`
-
-bash
-
-```bash
-#!/bin/bash
-
-set -e
-
-echo "Starting Gazebo Harmonic"
-echo "Partition: ${GZ_PARTITION}"
-
-exec "$@"
-```
-
----
-
-# 6\. SO-101 Dockerfile
-
-File: `so101/Dockerfile`
-
-dockerfile
-
-```dockerfile
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
-    curl \
-    wget \
-    git \
-    gnupg \
-    lsb-release \
-    build-essential \
-    cmake \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    python3-colcon-common-extensions \
-    python3-rosdep \
-    python3-vcstool \
-    libusb-1.0-0-dev \
-    libudev-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-    -o /usr/share/keyrings/ros-archive-keyring.gpg
-
-RUN echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu noble main" \
-    > /etc/apt/sources.list.d/ros2.list
-
-RUN apt-get update && apt-get install -y \
-    ros-jazzy-desktop \
-    ros-jazzy-ros2-control \
-    ros-jazzy-ros2-controllers \
-    ros-jazzy-joint-state-broadcaster \
-    ros-jazzy-joint-trajectory-controller \
-    ros-jazzy-moveit \
-    ros-jazzy-rmw-cyclonedds-cpp \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN python3 -m venv --system-site-packages /opt/lerobot-venv
-
-ENV PATH="/opt/lerobot-venv/bin:${PATH}"
-
-RUN pip install --no-cache-dir \
-    numpy \
-    opencv-python-headless \
-    pyserial \
-    feetech-servo-sdk
-
-WORKDIR /workspace
-
-RUN mkdir -p \
-    /workspace/ros2_ws/src \
-    /workspace/lerobot \
-    /data
-
-COPY entrypoint.sh /entrypoint.sh
-
-RUN chmod +x /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
-
-CMD ["bash"]
-```
-
-**Dependency note:** This is a starting image, not a tested build. The exact PyTorch/CUDA wheel, LeRobot release, Gazebo Transport client and SO-101 dependencies must be pinned and validated together.
-
-## 6.1 `so101/entrypoint.sh`
-
-bash
-
-```bash
-#!/bin/bash
-
-set -e
-
-source /opt/ros/jazzy/setup.bash
-
-if [ -f /workspace/ros2_ws/install/setup.bash ]; then
-    source /workspace/ros2_ws/install/setup.bash
-fi
-
-exec "$@"
-```
-
----
-
-# 7\. Dynamic Gazebo environment
-
-This is an important part of the project.
-
-The environment must not be hardcoded.
-
-Instead, the user provides parameters and a Python generator creates the SDF world.
-
-The workflow:
-
-text
-
-```text
-environment.json
-       |
-       v
-generate_world.py
-       |
-       v
-table_world.sdf
-       |
-       v
-Gazebo Harmonic
-```
-
-The Docker image does not need rebuilding when the environment changes.
-
-## 7.1 Configuration file
-
-File: `so101/config/environment.json`
-
-json
-
-```json
-{
-  "world": {
-    "name": "table_world",
-    "physics": {
-      "step_size": 0.001,
-      "real_time_factor": 1.0
-    }
-  },
-
-  "table": {
-    "size": [1.2, 0.8, 0.05],
-    "height": 0.75,
-    "color": [0.55, 0.35, 0.15, 1.0]
-  },
-
-  "objects": [
-    {
-      "name": "red_cube",
-      "type": "box",
-      "size": [0.04, 0.04, 0.04],
-      "position": [-0.25, 0.0, 0.80],
-      "color": [1, 0, 0, 1],
-      "mass": 0.1
-    },
-
-    {
-      "name": "blue_cube",
-      "type": "box",
-      "size": [0.04, 0.04, 0.04],
-      "position": [0, 0, 0.80],
-      "color": [0, 0, 1, 1],
-      "mass": 0.1
-    },
-
-    {
-      "name": "green_cylinder",
-      "type": "cylinder",
-      "radius": 0.025,
-      "length": 0.08,
-      "position": [0.25, 0, 0.82],
-      "color": [0, 1, 0, 1],
-      "mass": 0.15
-    }
-  ],
-
-  "robots": [
-    {
-      "name": "so101_01",
-      "model_uri": "/workspace/models/so101",
-      "position": [-0.7, 0, 0],
-      "orientation": [0, 0, 0]
-    },
-
-    {
-      "name": "so101_02",
-      "model_uri": "/workspace/models/so101",
-      "position": [0.7, 0, 0],
-      "orientation": [0, 0, 3.14159]
-    }
-  ],
-
-  "cameras": [
-    {
-      "name": "overhead_camera",
-      "position": [0, 0, 1.8],
-      "orientation": [0, 1.5708, 0],
-      "width": 1280,
-      "height": 720,
-      "fov": 1.047
-    }
-  ]
-}
-```
-
-## 7.2 Supported parameters
-
-| Parameter | Description |
-| --- | --- |
-| `world.name` | World name |
-| `physics.step_size` | Physics time step |
-| `physics.real_time_factor` | Simulation speed |
-| `table.size` | Table dimensions |
-| `table.height` | Table height |
-| `table.color` | Table color |
-| `objects` | List of objects |
-| `objects[].type` | Box, cylinder or sphere |
-| `objects[].position` | Object coordinates |
-| `objects[].color` | Object color |
-| `robots` | List of robots |
-| `robots[].name` | Robot namespace/name |
-| `robots[].position` | Robot spawn position |
-| `robots[].orientation` | Robot orientation |
-| `cameras` | Camera definitions |
-
-# 8\. Python Gazebo world generator
-
-File: `tools/generate_world.py`
-
-This version supports:
-
-- Tables.
-- Boxes.
-- Cylinders.
-- Spheres.
-- Multiple robots using existing Gazebo model directories.
-- Multiple cameras.
-- Physics parameters.
-- SDF output.
-- Environment ZIP export.
-
-python
-
-```python
-#!/usr/bin/env python3
-
-import argparse
-import json
-import zipfile
-
-from pathlib import Path
-from xml.etree import ElementTree as ET
-
-
-def add(parent, tag, value=None, **attrs):
-    node = ET.SubElement(parent, tag, attrs)
-
-    if value is not None:
-        node.text = str(value)
-
-    return node
-
-
-def vec(values):
-    return " ".join(map(str, values))
-
-
-def add_geometry(parent, obj):
-    geometry = add(parent, "geometry")
-    kind = obj["type"]
-
-    if kind == "box":
-        box = add(geometry, "box")
-        add(box, "size", vec(obj["size"]))
-
-    elif kind == "cylinder":
-        cylinder = add(geometry, "cylinder")
-        add(cylinder, "radius", obj["radius"])
-        add(cylinder, "length", obj["length"])
-
-    elif kind == "sphere":
-        sphere = add(geometry, "sphere")
-        add(sphere, "radius", obj["radius"])
-
-    else:
-        raise ValueError(f"Unsupported type: {kind}")
-
-
-def inertia(obj, mass):
-    if obj["type"] == "box":
-        x, y, z = obj["size"]
-
-        return (
-            mass * (y*y + z*z) / 12,
-            mass * (x*x + z*z) / 12,
-            mass * (x*x + y*y) / 12
-        )
-
-    if obj["type"] == "cylinder":
-        r = obj["radius"]
-        h = obj["length"]
-
-        i = mass * (3*r*r + h*h) / 12
-        iz = mass * r*r / 2
-
-        return i, i, iz
-
-    if obj["type"] == "sphere":
-        i = 0.4 * mass * obj["radius"]**2
-        return i, i, i
-
-    raise ValueError(obj["type"])
-
-
-def add_object(world, obj):
-    model = add(world, "model", name=obj["name"])
-
-    x, y, z = obj["position"]
-    add(model, "pose", f"{x} {y} {z} 0 0 0")
-
-    link = add(model, "link", name="link")
-
-    mass = float(obj.get("mass", 0.1))
-    ixx, iyy, izz = inertia(obj, mass)
-
-    inertial = add(link, "inertial")
-    add(inertial, "mass", mass)
-
-    tensor = add(inertial, "inertia")
-    add(tensor, "ixx", ixx)
-    add(tensor, "iyy", iyy)
-    add(tensor, "izz", izz)
-    add(tensor, "ixy", 0)
-    add(tensor, "ixz", 0)
-    add(tensor, "iyz", 0)
-
-    collision = add(link, "collision", name="collision")
-    add_geometry(collision, obj)
-
-    visual = add(link, "visual", name="visual")
-    add_geometry(visual, obj)
-
-    material = add(visual, "material")
-    add(material, "ambient", vec(obj["color"]))
-    add(material, "diffuse", vec(obj["color"]))
-
-
-def add_table(world, config):
-    table = config["table"]
-
-    x, y, thickness = table["size"]
-    height = table["height"]
-
-    model = add(world, "model", name="table")
-    add(model, "static", "true")
-
-    link = add(model, "link", name="table_link")
-
-    add(
-        model,
-        "pose",
-        f"0 0 {height - thickness / 2} 0 0 0"
-    )
-
-    shape = {
-        "type": "box",
-        "size": [x, y, thickness]
-    }
-
-    collision = add(link, "collision", name="collision")
-    add_geometry(collision, shape)
-
-    visual = add(link, "visual", name="visual")
-    add_geometry(visual, shape)
-
-    material = add(visual, "material")
-    color = vec(table["color"])
-
-    add(material, "ambient", color)
-    add(material, "diffuse", color)
-
-    leg_height = height - thickness
-    leg_size = 0.05
-
-    for index, (lx, ly) in enumerate([
-        (-x/2 + leg_size, -y/2 + leg_size),
-        ( x/2 - leg_size, -y/2 + leg_size),
-        (-x/2 + leg_size,  y/2 - leg_size),
-        ( x/2 - leg_size,  y/2 - leg_size)
-    ]):
-
-        leg = add(model, "link", name=f"leg_{index}")
-
-        add(
-            leg,
-            "pose",
-            f"{lx} {ly} {-leg_height/2 - thickness/2} 0 0 0"
-        )
-
-        leg_shape = {
-            "type": "box",
-            "size": [leg_size, leg_size, leg_height]
-        }
-
-        collision = add(leg, "collision", name="collision")
-        add_geometry(collision, leg_shape)
-
-        visual = add(leg, "visual", name="visual")
-        add_geometry(visual, leg_shape)
-
-        material = add(visual, "material")
-        add(material, "ambient", color)
-        add(material, "diffuse", color)
-
-
-def add_robot(world, robot):
-    model_path = Path(robot["model_uri"])
-
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Missing robot model: {model_path}"
-        )
-
-    include = add(world, "include")
-
-    add(
-        include,
-        "uri",
-        model_path.resolve().as_uri()
-    )
-
-    add(include, "name", robot["name"])
-
-    x, y, z = robot["position"]
-    r, p, yaw = robot.get("orientation", [0, 0, 0])
-
-    add(include, "pose", f"{x} {y} {z} {r} {p} {yaw}")
-
-
-def add_camera(world, camera):
-    model = add(world, "model", name=camera["name"])
-
-    add(model, "static", "true")
-
-    x, y, z = camera["position"]
-    r, p, yaw = camera.get("orientation", [0, 0, 0])
-
-    add(model, "pose", f"{x} {y} {z} {r} {p} {yaw}")
-
-    link = add(model, "link", name="camera_link")
-
-    sensor = add(
-        link,
-        "sensor",
-        name=camera["name"],
-        type="camera"
-    )
-
-    add(sensor, "always_on", "true")
-    add(sensor, "update_rate", camera.get("update_rate", 30))
-
-    camera_node = add(sensor, "camera")
-
-    add(
-        camera_node,
-        "horizontal_fov",
-        camera.get("fov", 1.047)
-    )
-
-    image = add(camera_node, "image")
-
-    add(image, "width", camera.get("width", 640))
-    add(image, "height", camera.get("height", 480))
-    add(image, "format", "R8G8B8")
-
-    clip = add(camera_node, "clip")
-
-    add(clip, "near", 0.05)
-    add(clip, "far", 20.0)
-
-
-def generate(config, output):
-    root = ET.Element("sdf", version="1.9")
-
-    world = add(
-        root,
-        "world",
-        name=config["world"]["name"]
-    )
-
-    physics = config["world"]["physics"]
-
-    physics_node = add(
-        world,
-        "physics",
-        name="physics",
-        type="ignored"
-    )
-
-    add(
-        physics_node,
-        "max_step_size",
-        physics["step_size"]
-    )
-
-    add(
-        physics_node,
-        "real_time_factor",
-        physics["real_time_factor"]
-    )
-
-    for filename, name in [
-        (
-            "gz-sim-physics-system",
-            "gz::sim::systems::Physics"
-        ),
-        (
-            "gz-sim-user-commands-system",
-            "gz::sim::systems::UserCommands"
-        ),
-        (
-            "gz-sim-scene-broadcaster-system",
-            "gz::sim::systems::SceneBroadcaster"
-        ),
-        (
-            "gz-sim-sensors-system",
-            "gz::sim::systems::Sensors"
-        )
-    ]:
-        plugin = add(
-            world,
-            "plugin",
-            filename=filename,
-            name=name
-        )
-
-        if name.endswith("Sensors"):
-            add(plugin, "render_engine", "ogre2")
-
-    light = add(world, "light", name="sun", type="directional")
-
-    add(light, "pose", "0 0 5 0 0 0")
-    add(light, "direction", "-0.5 0.5 -1")
-    add(light, "diffuse", "0.8 0.8 0.8 1")
-
-    ground = add(world, "model", name="ground")
-    add(ground, "static", "true")
-
-    ground_link = add(ground, "link", name="ground_link")
-
-    for tag in ["collision", "visual"]:
-        node = add(ground_link, tag, name=tag)
-
-        geometry = add(node, "geometry")
-        plane = add(geometry, "plane")
-
-        add(plane, "normal", "0 0 1")
-        add(plane, "size", "20 20")
-
-    add_table(world, config)
-
-    for obj in config.get("objects", []):
-        add_object(world, obj)
-
-    for robot in config.get("robots", []):
-        add_robot(world, robot)
-
-    for camera in config.get("cameras", []):
-        add_camera(world, camera)
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    ET.indent(root, space="  ")
-
-    ET.ElementTree(root).write(
-        output,
-        encoding="utf-8",
-        xml_declaration=True
-    )
-
-    print(f"Generated world: {output}")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--config",
-        default="so101/config/environment.json"
-    )
-
-    parser.add_argument(
-        "--output",
-        default="gazebo/worlds/table_world.sdf"
-    )
-
-    parser.add_argument(
-        "--zip",
-        default="output/gazebo_environment.zip"
-    )
-
-    args = parser.parse_args()
-
-    config_path = Path(args.config)
-    output_path = Path(args.output)
-
-    config = json.loads(config_path.read_text())
-
-    generate(config, output_path)
-
-    zip_path = Path(args.zip)
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(
-        zip_path,
-        "w",
-        zipfile.ZIP_DEFLATED
-    ) as archive:
-
-        archive.write(
-            output_path,
-            "worlds/table_world.sdf"
-        )
-
-        archive.write(
-            config_path,
-            "environment.json"
-        )
-
-    print(f"Created environment archive: {zip_path}")
-
-
-if __name__ == "__main__":
-    main()
-```
-
-**Note:** The camera sensor requires the Gazebo Sensors system and a working rendering backend. The generator creates camera models but does not yet configure camera-to-ROS image transport.
-
----
-
-# 9\. Multi-robot configuration
-
-File: `so101/config/robots.yaml`
-
-yaml
-
-```yaml
-world: table_world
-
-gazebo_partition: so101_simulation
-
-robots:
-
-  - name: so101_01
-    backend: gazebo
-
-    x: -0.7
-    y: 0.0
-    z: 0.0
-
-    yaw: 0.0
-
-  - name: so101_02
-    backend: gazebo
-
-    x: 0.7
-    y: 0.0
-    z: 0.0
-
-    yaw: 3.14159
-
-  - name: so101_03
-    backend: gazebo
-
-    x: 0.0
-    y: 0.7
-    z: 0.0
-
-    yaw: 1.5708
-```
-
-Each robot must have:
-
-- Unique Gazebo model name.
-- Unique Gazebo command topic.
-- Unique state topic.
-- Unique ROS 2 namespace.
-- Independent controller manager.
-- Independent joint states.
-- Independent LeRobot instance configuration.
-
-For example:
-
-text
-
-```text
-/model/so101_01/joint_cmd
-/model/so101_01/joint_state
-
-/model/so101_02/joint_cmd
-/model/so101_02/joint_state
-```
-
-These are proposed custom Gazebo Transport topics. They must be implemented in the Gazebo plugin.
-
----
-
-# 10\. SO-101 joint configuration
-
-The SO-101 has six actuated joints.
-
-File: `so101/config/controllers.yaml`
-
-yaml
-
-```yaml
-controller_manager:
-  ros__parameters:
-
-    update_rate: 100
-
-    joint_state_broadcaster:
-      type: joint_state_broadcaster/JointStateBroadcaster
-
-    arm_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
-
-    gripper_controller:
-      type: forward_command_controller/ForwardCommandController
-
-
-arm_controller:
-  ros__parameters:
-
-    joints:
-      - shoulder_pan
-      - shoulder_lift
-      - elbow_flex
-      - wrist_flex
-      - wrist_roll
-
-    command_interfaces:
-      - position
-
-    state_interfaces:
-      - position
-      - velocity
-
-    state_publish_rate: 50.0
-    action_monitor_rate: 20.0
-
-
-gripper_controller:
-  ros__parameters:
-
-    joints:
-      - gripper
-
-    interface_name: position
-
-    state_interfaces:
-      - position
-      - velocity
-```
-
-The final joint names and limits must be checked against the selected official SO-101 URDF.
-
----
-
-# 11\. C++ ROS 2 hardware interface
-
-Package:
-
-`so101_hardware`
-
-Directory:
-
-text
-
-```text
-so101_hardware/
-├── CMakeLists.txt
-├── package.xml
-│
-├── include/
-│   └── so101_hardware/
-│       ├── so101_system.hpp
-│       └── gazebo_transport.hpp
-│
-└── src/
-    ├── so101_system.cpp
-    └── gazebo_transport.cpp
-```
-
-## 11.1 Responsibilities
-
-The hardware interface should:
-
-1. Implement `hardware_interface::SystemInterface`.
-2. Export six position command interfaces.
-3. Export position and velocity state interfaces.
-4. Receive joint state from Gazebo Transport.
-5. Send joint commands to Gazebo Transport.
-6. Support multiple independent robot instances.
-7. Provide communication timeout handling.
-8. Support physical Feetech hardware as a separate backend.
-
-## 11.2 Header
-
-File:
-
-`include/so101_hardware/so101_system.hpp`
-
-cpp
-
-```cpp
-#pragma once
-
-#include <string>
-#include <vector>
-
-#include "hardware_interface/system_interface.hpp"
-#include "hardware_interface/types/hardware_interface_type_values.hpp"
-
-#include "rclcpp/rclcpp.hpp"
-
-namespace so101_hardware
-{
-
-class SO101System : public hardware_interface::SystemInterface
-{
-
-public:
-
-    hardware_interface::CallbackReturn on_init(
-        const hardware_interface::HardwareInfo & info
-    ) override;
-
-    std::vector<hardware_interface::StateInterface>
-    export_state_interfaces() override;
-
-    std::vector<hardware_interface::CommandInterface>
-    export_command_interfaces() override;
-
-    hardware_interface::CallbackReturn on_activate(
-        const rclcpp_lifecycle::State & previous_state
-    ) override;
-
-    hardware_interface::CallbackReturn on_deactivate(
-        const rclcpp_lifecycle::State & previous_state
-    ) override;
-
-    hardware_interface::return_type read(
-        const rclcpp::Time & time,
-        const rclcpp::Duration & period
-    ) override;
-
-    hardware_interface::return_type write(
-        const rclcpp::Time & time,
-        const rclcpp::Duration & period
-    ) override;
-
-
-private:
-
-    std::string robot_name_;
-
-    std::vector<double> position_;
-    std::vector<double> velocity_;
-    std::vector<double> command_;
-
-};
-
-}
-```
-
-This header defines the interface, not a complete plugin. The source implementation and Gazebo Transport client must be added before it can be loaded by controller manager.
-
-## 11.3 Communication design
-
-The Gazebo client should expose an abstraction similar to:
-
-cpp
-
-```cpp
-class GazeboTransportClient
-{
-public:
-
-    bool connect(const std::string & robot_name);
-
-    bool send_command(
-        const std::vector<double> & positions
-    );
-
-    bool get_state(
-        std::vector<double> & positions,
-        std::vector<double> & velocities
-    );
-
-    bool is_connected() const;
-
-    void stop();
-
-};
-```
-
-Use Gazebo Transport publishers and subscribers.
-
-A suitable message choice is a custom Gazebo message containing:
-
-- Robot identifier.
-- Joint names.
-- Position commands.
-- Timestamp or sequence number.
-
-The state message should contain:
-
-- Joint names.
-- Positions.
-- Velocities.
-- Simulation timestamp.
-
-For a first implementation, `gz.msgs.Joint` or `gz.msgs.Model` can be evaluated, but a custom message provides better control over robot identity and joint ordering.
-
-**Important:** The actual C++ Gazebo client, plugin and `SystemInterface` implementation are not included here. They must be implemented and tested together. The header alone is not a functioning hardware interface.
-
----
-
-# 12\. LeRobot integration
-
-LeRobot should communicate through the ROS 2 hardware interface.
-
-It should not independently control Gazebo motors.
-
-text
-
-```text
-LeRobot policy
-     |
-     v
-SO-101 Python adapter
-     |
-     v
-ROS 2 action / controller
-     |
-     v
-SO101SystemInterface
-     |
-     v
-Gazebo Transport
-```
-
-This provides one consistent control path for simulation and physical hardware.
-
-## 12.1 Python adapter structure
-
-File:
-
-`so101/lerobot/so101_gazebo/robot.py`
-
-python
-
-```python
-class SO101Robot:
-
-    def __init__(
-        self,
-        robot_id="so101_01",
-        backend="simulation"
-    ):
-
-        self.robot_id = robot_id
-        self.backend = backend
-
-    def connect(self):
-        """
-        Connect to the selected SO-101 backend.
-        """
-        raise NotImplementedError
-
-    def get_observation(self):
-        """
-        Return joint positions and camera observations.
-        """
-        raise NotImplementedError
-
-    def send_action(self, action):
-        """
-        Send a validated robot action.
-        """
-        raise NotImplementedError
-
-    def disconnect(self):
-        """
-        Release communication resources.
-        """
-        raise NotImplementedError
-```
-
-The final adapter must implement the interface required by the pinned LeRobot version.
-
-## 12.2 Observation structure
-
-Example:
-
-python
-
-```python
-observation = {
-
-    "observation.state": [
-        0.0,
-        0.2,
-        -0.3,
-        0.1,
-        0.0,
-        0.4
-    ],
-
-    "observation.images.top": camera_image
-
-}
-```
-
-## 12.3 Action structure
-
-python
-
-```python
-action = {
-
-    "shoulder_pan": 0.1,
-
-    "shoulder_lift": 0.3,
-
-    "elbow_flex": -0.2,
-
-    "wrist_flex": 0.1,
-
-    "wrist_roll": 0.0,
-
-    "gripper": 0.5
-
-}
-```
-
----
-
-# 13\. MoveIt 2 and RViz2
-
-MoveIt should use the same robot description as the Gazebo simulation.
-
-The package should contain:
-
-text
-
-```text
-so101_moveit_config/
-├── config/
-│   ├── joint_limits.yaml
-│   ├── kinematics.yaml
-│   ├── moveit_controllers.yaml
-│   └── ros2_controllers.yaml
-│
-├── launch/
-│   ├── demo.launch.py
-│   └── move_group.launch.py
-│
-└── config/
-    └── so101.srdf
-```
-
-Each robot should have its own MoveIt planning group and namespace.
-
-For example:
-
-text
-
-```text
-/so101_01/move_group
-/so101_02/move_group
-```
-
-The MoveIt controller configuration must point to the corresponding ROS 2 controllers.
-
----
-
-# 14\. ros2docker modifications
-
-The original repository should remain the foundation.
-
-Repository:
-
-https://github.com/DavideCapuzz/ros2docker
-
-The proposed modifications are:
-
-| File | Modification |
-| --- | --- |
-| `template/install_robot_deps.sh` | Fix installation functions |
-| `template/install_robot_deps.sh` | Remove empty APT commands |
-| `template/install_robot_deps.sh` | Validate profile names |
-| `template/init_setup.sh` | Create directories before copying |
-| `setup.ini` | Add Gazebo and SO-101 profiles |
-| Dockerfile | Ubuntu 24.04 compatibility |
-| Dockerfile | ROS 2 Jazzy support |
-| Scripts | NVIDIA validation |
-
-## 14.1 Installation profiles
-
-text
-
-```text
-minimal
-    ROS 2 essentials
-
-gazebo
-    Gazebo-related development dependencies
-
-so101
-    ros2_control
-    Feetech SDK
-    Python dependencies
-
-navigation
-    Nav2
-
-perception
-    OpenCV
-    PCL
-
-full
-    Selected robotics development dependencies
-```
-
-The Gazebo container remains independent of ROS 2.
-
-The SO-101 container installs ROS 2 and LeRobot.
-
-The final profile composition should be validated against the actual original ros2docker setup mechanism.
-
-# 15\. Environment generation commands
-
-## Generate a world
-
-bash
-
-```bash
-python3 tools/generate_world.py \
-    --config so101/config/environment.json \
-    --output gazebo/worlds/table_world.sdf
-```
-
-## Export the environment
-
-bash
-
-```bash
-python3 tools/generate_world.py \
-    --config so101/config/environment.json \
-    --output gazebo/worlds/table_world.sdf \
-    --zip output/environment.zip
-```
-
-## Start Gazebo
-
-bash
-
-```bash
-docker compose up -d gazebo
-```
-
-## Change the environment
-
-1. Edit `environment.json`.
-2. Generate a new SDF.
-3. Stop Gazebo.
-4. Start Gazebo again.
-
-bash
-
-```bash
-docker compose stop gazebo
-
-python3 tools/generate_world.py \
-    --config so101/config/environment.json
-
-docker compose up -d gazebo
-```
-
-No image rebuild is needed.
-
-## Important improvement: randomization
-
-The next version of the generator should support:
-
-bash
-
-```bash
-python3 tools/generate_world.py \
-    --config so101/config/environment.json \
-    --randomize \
-    --seed 42
-```
-
-Randomization should include:
-
-- Object positions.
-- Object rotations.
-- Object dimensions within configured limits.
-- Object colors.
-- Object count.
-- Camera positions.
-- Table dimensions.
-
-The generator should validate object collisions and table boundaries before producing the world.
-
-A random seed must be saved alongside each dataset so that a training scene can be reproduced.
-
----
-
-# 16\. Docker build scripts
-
-## `scripts/build.sh`
-
-bash
-
-```bash
-#!/usr/bin/env bash
-
-set -euo pipefail
-
-cd "$(dirname "$0")/.."
-
-echo "Building Gazebo..."
-
-docker compose build gazebo
-
-echo "Building SO-101..."
-
-docker compose build so101
-
-echo "Build complete."
-```
-
-## `scripts/start.sh`
-
-bash
-
-```bash
-#!/usr/bin/env bash
-
-set -euo pipefail
-
-cd "$(dirname "$0")/.."
-
-docker compose up -d
-
-docker compose ps
-```
-
-## `scripts/stop.sh`
-
-bash
-
-```bash
-#!/usr/bin/env bash
-
-set -euo pipefail
-
-cd "$(dirname "$0")/.."
-
-docker compose down
-```
-
-## `scripts/shell_gazebo.sh`
-
-bash
-
-```bash
-#!/usr/bin/env bash
-
-docker exec -it gazebo_sim bash
-```
-
-## `scripts/shell_so101.sh`
-
-bash
-
-```bash
-#!/usr/bin/env bash
-
-docker exec -it so101_environment bash
-```
-
-## `scripts/generate_world.sh`
-
-bash
-
-```bash
-#!/usr/bin/env bash
-
-set -euo pipefail
-
-cd "$(dirname "$0")/.."
-
-python3 tools/generate_world.py \
-    --config so101/config/environment.json \
-    --output gazebo/worlds/table_world.sdf \
-    --zip output/environment.zip
-```
-
-Make scripts executable:
-
-bash
-
-```bash
-chmod +x scripts/*.sh
-```
-
----
-
-# 17\. Ubuntu 24.04 installation
-
-Install Docker Engine and NVIDIA Container Toolkit.
-
-Official documentation:
-
-- Docker: https://docs.docker.com/engine/install/ubuntu/
-- NVIDIA: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
-
-Check the GPU:
-
-bash
-
-```bash
-nvidia-smi
-```
-
-Check Docker:
-
-bash
-
-```bash
-docker --version
-
-docker compose version
-```
-
-Check GPU access from Docker:
-
-bash
-
-```bash
-docker run --rm --gpus all \
-    nvidia/cuda:12.8.1-base-ubuntu24.04 \
-    nvidia-smi
-```
-
-If the command succeeds, NVIDIA GPU access is working inside Docker.
-
----
-
-# 18\. Build and launch
+## 4\. Download TheRobotStudio repository
 
 From the project root:
 
 bash
 
 ```bash
-./scripts/build.sh
+mkdir -p robots/so101/description/original
+
+git clone \
+    https://github.com/TheRobotStudio/SO-ARM100.git \
+    robots/so101/description/original/SO-ARM100
 ```
 
-Generate the environment:
+The model we use is:
+
+text
+
+```text
+robots/so101/description/original/SO-ARM100/Simulation/SO101/so101_new_calib.urdf
+```
+
+The corresponding meshes are in:
+
+text
+
+```text
+robots/so101/description/original/SO-ARM100/Simulation/SO101/assets/
+```
+
+The original README explains the calibration conventions and the relationship between the URDF and MuJoCo models.
+
+References:
+
+- [TheRobotStudio SO-ARM100](<https://github.com/TheRobotStudio/SO-ARM100?utm_source=chatgpt.com>)
+- [SO-101 documentation](<https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/README.md?utm_source=chatgpt.com>)
+- [Original new-calibration URDF](<https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf?utm_source=chatgpt.com>)
+
+## 5\. Validate the original meshes
+
+Run:
 
 bash
 
 ```bash
-./scripts/generate_world.sh
+cd robots/so101/description/original/SO-ARM100/Simulation/SO101
 ```
 
-Start the containers:
+Check the files:
 
 bash
 
 ```bash
-./scripts/start.sh
+ls -l so101_new_calib.urdf
+
+ls assets/
 ```
 
-Check the containers:
+Check every referenced mesh:
 
 bash
 
 ```bash
-docker compose ps
+python3 - <<'PY'
+import os
+import xml.etree.ElementTree as ET
+
+urdf = "so101_new_calib.urdf"
+root = ET.parse(urdf).getroot()
+
+missing = []
+
+for mesh in root.findall(".//mesh"):
+    filename = mesh.attrib["filename"]
+
+    path = os.path.join(
+        os.path.dirname(urdf),
+        filename
+    )
+
+    if not os.path.isfile(path):
+        missing.append(path)
+
+if missing:
+    print("Missing meshes:")
+    for path in missing:
+        print(path)
+    raise SystemExit(1)
+
+print("All referenced meshes exist.")
+PY
 ```
 
-Open the Gazebo terminal:
+Do not change the original URDF to solve a resource-path problem.
+
+---
+
+# PART B — ros2docker
+
+## 6\. Clone ros2docker
+
+If it is not already installed:
 
 bash
 
 ```bash
-./scripts/shell_gazebo.sh
+git submodule add \
+    https://github.com/DavideCapuzz/ros2docker.git \
+    .devcontainer/ros2docker
+
+git submodule update --init --recursive
 ```
 
-Open the SO-101 terminal:
+We retain its existing:
+
+- Dockerfile.
+- Entrypoint.
+- Compose generator.
+- Template files.
+- Workspace convention.
+
+We will add only the project-specific files described below.
+
+## 7\. Fix ros2docker init\_setup.sh
+
+**Path:**
+
+text
+
+```text
+.devcontainer/ros2docker/scripts/init_setup.sh
+```
+
+Replace the complete file with:
 
 bash
 
 ```bash
-./scripts/shell_so101.sh
+#!/bin/bash
+
+set -e
+
+mkdir -p ./tmp
+mkdir -p ./tmp/robot1
+
+copy_or_template() {
+    local source_file="$1"
+    local template_file="$2"
+    local destination="$3"
+    local description="$4"
+
+    if [ -f "$source_file" ]; then
+        cp "$source_file" "$destination"
+        echo "Copied $description"
+    else
+        cp "$template_file" "$destination"
+        echo "Using template for $description"
+    fi
+}
+
+if [ -f ../docker-compose.yml ]; then
+
+    cp ../docker-compose.yml ./tmp/docker-compose.yml
+
+    bash scripts/copy_endfunction.sh
+
+elif [ -f ../setup.ini ]; then
+
+    bash scripts/init_docker-compose.sh ../setup.ini
+
+else
+
+    cp template/docker-compose.yml ./tmp/docker-compose.yml
+
+    copy_or_template \
+        ../endfunction.sh \
+        template/endfunction.sh \
+        ./tmp/robot1/endfunction.sh \
+        "endfunction.sh"
+
+fi
+
+copy_or_template \
+    ../entrypoint.sh \
+    template/entrypoint.sh \
+    ./tmp/entrypoint.sh \
+    "entrypoint.sh"
+
+copy_or_template \
+    ../install_robot_deps.sh \
+    template/install_robot_deps.sh \
+    ./tmp/install_robot_deps.sh \
+    "install_robot_deps.sh"
+
+echo "ros2docker initialization completed."
+```
+
+This fixes the fallback directory problem and ensures that a failing generator stops initialization.
+
+We do not change `init_docker-compose.sh`.
+
+---
+
+# PART C — Two-container configuration
+
+## 8\. setup.ini
+
+**Path:**
+
+text
+
+```text
+.devcontainer/setup.ini
+```
+
+Complete file:
+
+ini
+
+```ini
+[gazebo]
+install_profile=gazebo
+ros_install=osrf/ros:jazzy-ros-base
+ros_domain=42
+network=ros2_network
+volumes=
+endfunction=gazebo/endfunction.sh
+
+
+[robot1]
+install_profile=custom
+ros_install=osrf/ros:jazzy-desktop-full
+ros_domain=0
+network=ros2_network
+volumes=build,install,log
+endfunction=robot1/endfunction.sh
+```
+
+### Why these settings?
+
+| Parameter | Gazebo | Robot1 |
+| --- | --- | --- |
+| Image | ROS base | ROS desktop full |
+| ROS distribution | Jazzy | Jazzy |
+| ROS domain | 42 | 0 |
+| Network | ros2\_network | ros2\_network |
+| Workspace | None mounted | Complete SO-101 workspace |
+| Build volumes | None | Independent |
+| Startup | Gazebo server | ROS environment |
+
+Gazebo does not need the complete robot workspace.
+
+Robot1 does.
+
+The different ROS domains prevent accidental ROS 2 DDS communication between the containers.
+
+Gazebo Transport is independent of these ROS domain IDs.
+
+---
+
+## 9\. install\_robot\_deps.sh
+
+**Path:**
+
+text
+
+```text
+.devcontainer/install_robot_deps.sh
+```
+
+Complete file:
+
+bash
+
+```bash
+#!/bin/bash
+
+set -e
+
+PROFILE="${1:-custom}"
+ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+
+echo "===================================="
+echo "Installing dependencies"
+echo "Profile: $PROFILE"
+echo "ROS: $ROS_DISTRO"
+echo "===================================="
+
+install_common() {
+
+    apt-get update
+
+    apt-get install -y \
+        x11-utils \
+        python3-pip \
+        python3-venv \
+        python3-colcon-common-extensions \
+        python3-rosdep \
+        git \
+        curl \
+        wget
+
+}
+
+install_gazebo() {
+
+    echo "Installing Gazebo Harmonic integration"
+
+    apt-get update
+
+    apt-get install -y \
+        ros-${ROS_DISTRO}-ros-gz-sim
+
+}
+
+install_robot() {
+
+    echo "Installing SO-101 ROS dependencies"
+
+    apt-get update
+
+    apt-get install -y \
+        ros-${ROS_DISTRO}-ros-gz \
+        ros-${ROS_DISTRO}-ros-gz-bridge \
+        ros-${ROS_DISTRO}-ros-gz-sim \
+        ros-${ROS_DISTRO}-robot-state-publisher \
+        ros-${ROS_DISTRO}-xacro \
+        ros-${ROS_DISTRO}-ros2-control \
+        ros-${ROS_DISTRO}-ros2-controllers \
+        ros-${ROS_DISTRO}-moveit
+
+}
+
+install_common
+
+case "$PROFILE" in
+
+    gazebo)
+
+        install_gazebo
+        ;;
+
+    custom)
+
+        install_robot
+        ;;
+
+    minimal)
+
+        install_common
+        ;;
+
+    *)
+
+        echo "Unknown profile: $PROFILE"
+        echo "Available profiles: gazebo, custom, minimal"
+
+        exit 1
+        ;;
+
+esac
+
+apt-get clean
+
+rm -rf /var/lib/apt/lists/*
+
+echo "===================================="
+echo "Installation completed"
+echo "===================================="
+```
+
+A few important details:
+
+- `x11-utils` provides `xdpyinfo`, which the ros2docker entrypoint uses.
+- `ros-gz-sim` provides the Gazebo integration and spawning utility.
+- `ros-gz-bridge` is installed in robot1.
+- MoveIt and ros2\_control are installed in robot1, but we will configure them in later phases.
+- LeRobot and PyTorch are installed separately.
+
+The `gazebo` profile deliberately does not install the complete ROS desktop stack.
+
+---
+
+# PART D — Compose post-processing
+
+## 10\. Why we need patch\_compose.py
+
+The original generator mounts:
+
+yaml
+
+```yaml
+volumes:
+  - ../../../src:/home/ubuntu/ros2_ws/src
+  - ../../../launch:/home/ubuntu/ros2_ws/launch
+```
+
+into every container.
+
+That is not what we want.
+
+We want:
+
+Gazebo:
+
+yaml
+
+```yaml
+volumes:
+  - ../../../simulation:/simulation:ro
+  - ../../../robots/so101/description/original/SO-ARM100/Simulation/SO101:/robot_assets/so101:ro
+```
+
+Robot1:
+
+yaml
+
+```yaml
+volumes:
+  - ../../../robots/so101/ros2_ws:/home/ubuntu/ros2_ws
+  - ../../../robots/so101/description/original/SO-ARM100/Simulation/SO101:/robot_assets/so101:ro
+  - ../../../data:/data
+  - robot1_build:/home/ubuntu/ros2_ws/build
+  - robot1_install:/home/ubuntu/ros2_ws/install
+  - robot1_log:/home/ubuntu/ros2_ws/log
+```
+
+We also want:
+
+- Unique Compose project name.
+- GPU access for robot1.
+- noVNC exposed only on localhost.
+- No unnecessary raw VNC port publication.
+
+Instead of modifying the original generator, we post-process its output.
+
+## 11\. patch\_compose.py
+
+**Path:**
+
+text
+
+```text
+.devcontainer/patch_compose.py
+```
+
+Complete file:
+
+python
+
+```python
+#!/usr/bin/env python3
+
+import os
+import re
+import sys
+from pathlib import Path
+
+
+if len(sys.argv) != 2:
+    print("Usage: patch_compose.py <docker-compose.yml>")
+    sys.exit(1)
+
+
+compose_file = Path(sys.argv[1])
+
+if not compose_file.is_file():
+    raise FileNotFoundError(compose_file)
+
+
+project_root = Path(__file__).resolve().parent.parent
+
+project_name = os.environ.get(
+    "ROS2DOCKER_PROJECT_NAME",
+    project_root.name.lower()
+)
+
+project_name = re.sub(
+    r"[^a-z0-9_-]",
+    "_",
+    project_name
+)
+
+
+lines = compose_file.read_text().splitlines()
+
+
+def find_service(name):
+
+    pattern = re.compile(rf"^  {re.escape(name)}:\s*$")
+
+    for i, line in enumerate(lines):
+
+        if pattern.match(line):
+
+            start = i
+
+            end = len(lines)
+
+            for j in range(i + 1, len(lines)):
+
+                if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[j]):
+                    end = j
+                    break
+
+                if re.match(r"^[A-Za-z][A-Za-z0-9_-]*:\s*$", lines[j]):
+                    end = j
+                    break
+
+            return start, end
+
+    raise RuntimeError(f"Service not found: {name}")
+
+
+def replace_section(block, section, replacement):
+
+    start = None
+
+    for i, line in enumerate(block):
+
+        if line == f"    {section}:":
+
+            start = i
+            break
+
+    if start is None:
+
+        block.extend(replacement)
+        return block
+
+    end = len(block)
+
+    for j in range(start + 1, len(block)):
+
+        if re.match(r"^    [A-Za-z0-9_-]+:", block[j]):
+            end = j
+            break
+
+    return block[:start] + replacement + block[end:]
+
+
+def patch_service(name, mounts, novnc_port, gpu=False):
+
+    start, end = find_service(name)
+
+    block = lines[start:end]
+
+    # ------------------------------------------------
+    # Service-specific volumes
+    # ------------------------------------------------
+
+    volume_lines = [
+        "",
+        "    volumes:",
+    ]
+
+    for mount in mounts:
+
+        volume_lines.append(f"      - {mount}")
+
+    block = replace_section(
+        block,
+        "volumes",
+        volume_lines
+    )
+
+    # ------------------------------------------------
+    # Ports: noVNC only, bound to localhost
+    # ------------------------------------------------
+
+    port_lines = [
+        "",
+        "    ports:",
+        f'      - "127.0.0.1:{novnc_port}:{novnc_port}"',
+    ]
+
+    block = replace_section(
+        block,
+        "ports",
+        port_lines
+    )
+
+    # ------------------------------------------------
+    # GPU support
+    # ------------------------------------------------
+
+    if gpu:
+
+        if not any(line.strip() == "gpus: all" for line in block):
+
+            insert_at = 1
+
+            for i, line in enumerate(block):
+
+                if line.strip().startswith("container_name:"):
+
+                    insert_at = i + 1
+                    break
+
+            block.insert(insert_at, "    gpus: all")
+
+        for i, line in enumerate(block):
+
+            if 'LIBGL_ALWAYS_SOFTWARE:' in line:
+
+                block[i] = '      LIBGL_ALWAYS_SOFTWARE: "0"'
+
+        environment_index = None
+
+        for i, line in enumerate(block):
+
+            if line == "    environment:":
+
+                environment_index = i
+                break
+
+        if environment_index is not None:
+
+            existing = "\n".join(block)
+
+            if "NVIDIA_VISIBLE_DEVICES:" not in existing:
+
+                block.insert(
+                    environment_index + 1,
+                    "      NVIDIA_VISIBLE_DEVICES: all"
+                )
+
+                block.insert(
+                    environment_index + 2,
+                    "      NVIDIA_DRIVER_CAPABILITIES: all"
+                )
+
+    # ------------------------------------------------
+    # Write the modified service back
+    # ------------------------------------------------
+
+    lines[start:end] = block
+
+
+# ----------------------------------------------------
+# Add unique Compose project name
+# ----------------------------------------------------
+
+if not any(line.startswith("name:") for line in lines):
+
+    service_index = next(
+        i for i, line in enumerate(lines)
+        if line == "services:"
+    )
+
+    lines.insert(
+        service_index,
+        f"name: {project_name}"
+    )
+
+
+# ----------------------------------------------------
+# Gazebo
+# ----------------------------------------------------
+
+patch_service(
+    name="gazebo",
+    mounts=[
+        "../../../simulation:/simulation:ro",
+        "../../../robots/so101/description/original/SO-ARM100/Simulation/SO101:/robot_assets/so101:ro",
+    ],
+    novnc_port=6080,
+)
+
+
+# ----------------------------------------------------
+# Robot1
+# ----------------------------------------------------
+
+patch_service(
+    name="robot1",
+    mounts=[
+        "../../../robots/so101/ros2_ws:/home/ubuntu/ros2_ws",
+        "../../../robots/so101/description/original/SO-ARM100/Simulation/SO101:/robot_assets/so101:ro",
+        "../../../data:/data",
+        "robot1_build:/home/ubuntu/ros2_ws/build",
+        "robot1_install:/home/ubuntu/ros2_ws/install",
+        "robot1_log:/home/ubuntu/ros2_ws/log",
+    ],
+    novnc_port=6081,
+    gpu=True,
+)
+
+
+compose_file.write_text(
+    "\n".join(lines) + "\n"
+)
+
+print("====================================")
+print("Compose post-processing completed")
+print("Project:", project_name)
+print("GPU enabled: robot1")
+print("Gazebo mounts: simulation + description")
+print("Robot1 mounts: workspace + description + data")
+print("VNC ports: localhost only")
+print("====================================")
+```
+
+This script preserves the top-level `volumes:` and `networks:` sections generated by ros2docker.
+
+It also retains the named-volume definitions generated from:
+
+ini
+
+```ini
+volumes=build,install,log
+```
+
+The GPU configuration requires a sufficiently recent Docker Compose version and NVIDIA Container Toolkit on the host.
+
+---
+
+## 12\. generate\_compose.sh
+
+**Path:**
+
+text
+
+```text
+.devcontainer/generate_compose.sh
+```
+
+Complete file:
+
+bash
+
+```bash
+#!/bin/bash
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+ROS2DOCKER_DIR="$SCRIPT_DIR/ros2docker"
+
+cd "$ROS2DOCKER_DIR"
+
+echo "Generating Compose using ros2docker..."
+
+bash scripts/init_setup.sh
+
+echo "Applying project-specific configuration..."
+
+python3 "$SCRIPT_DIR/patch_compose.py" \
+    tmp/docker-compose.yml
+
+echo "Validating generated Compose..."
+
+docker compose \
+    -f tmp/docker-compose.yml \
+    config
+
+echo "===================================="
+echo "Compose generation completed"
+echo "===================================="
+```
+
+Make executable:
+
+bash
+
+```bash
+chmod +x .devcontainer/generate_compose.sh
+```
+
+The resulting generated file remains:
+
+text
+
+```text
+.devcontainer/ros2docker/tmp/docker-compose.yml
+```
+
+We preserve the original ros2docker output location.
+
+# PART E — Container startup files
+
+## 13\. Gazebo endfunction.sh
+
+**Path:**
+
+text
+
+```text
+.devcontainer/gazebo/endfunction.sh
+```
+
+Complete file:
+
+bash
+
+```bash
+#!/bin/bash
+
+set -e
+
+ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+
+source "/opt/ros/${ROS_DISTRO}/setup.bash"
+
+export GZ_SIM_RESOURCE_PATH="/robot_assets/so101:${GZ_SIM_RESOURCE_PATH:-}"
+
+WORLD="/simulation/worlds/warehouse.sdf"
+
+echo "===================================="
+echo "Starting Gazebo Harmonic"
+echo "===================================="
+
+if [ ! -f "$WORLD" ]; then
+
+    echo "ERROR: World not found: $WORLD"
+
+    exit 1
+
+fi
+
+if ! command -v gz >/dev/null 2>&1; then
+
+    echo "ERROR: Gazebo executable not found"
+
+    exit 1
+
+fi
+
+exec gz sim -s -r "$WORLD"
+```
+
+This starts Gazebo in server-only mode.
+
+It does not start an additional ROS 2 bridge.
+
+Gazebo is responsible for physics and simulation.
+
+## 14\. Robot1 endfunction.sh
+
+**Path:**
+
+text
+
+```text
+.devcontainer/robot1/endfunction.sh
+```
+
+Complete file:
+
+bash
+
+```bash
+#!/bin/bash
+
+set -e
+
+ROS_DISTRO="${ROS_DISTRO:-jazzy}"
+
+source "/opt/ros/${ROS_DISTRO}/setup.bash"
+
+export GZ_SIM_RESOURCE_PATH="/robot_assets/so101:${GZ_SIM_RESOURCE_PATH:-}"
+
+export SO101_URDF="/robot_assets/so101/so101_new_calib.urdf"
+
+cd /home/ubuntu/ros2_ws
+
+if [ -f install/setup.bash ]; then
+
+    source install/setup.bash
+
+fi
+
+echo "===================================="
+echo "SO-101 Robot Environment"
+echo "===================================="
+
+echo "ROS: $ROS_DISTRO"
+
+echo "Workspace: /home/ubuntu/ros2_ws"
+
+echo "Robot description: $SO101_URDF"
+
+echo "Gazebo partition: $GZ_PARTITION"
+
+if [ ! -f "$SO101_URDF" ]; then
+
+    echo "ERROR: SO-101 URDF not found"
+
+    exit 1
+
+fi
+
+# Start the window manager for RViz and other GUI applications.
+openbox >/tmp/openbox.log 2>&1 &
+
+# Keep the container running.
+exec sleep infinity
+```
+
+Make both scripts executable:
+
+bash
+
+```bash
+chmod +x .devcontainer/gazebo/endfunction.sh
+
+chmod +x .devcontainer/robot1/endfunction.sh
 ```
 
 ---
 
-# 19\. Testing
+# PART F — Gazebo simulation
 
-These are the acceptance tests for the completed implementation.
+## 15\. Gazebo world
 
-## Test 1: Gazebo
+**Path:**
+
+text
+
+```text
+simulation/worlds/warehouse.sdf
+```
+
+Complete file:
+
+xml
+
+```xml
+<?xml version="1.0"?>
+
+<sdf version="1.9">
+
+  <world name="warehouse">
+
+    <gravity>0 0 -9.8</gravity>
+
+    <physics name="default_physics" type="ignored">
+
+      <max_step_size>0.001</max_step_size>
+
+      <real_time_factor>1.0</real_time_factor>
+
+      <real_time_update_rate>1000</real_time_update_rate>
+
+    </physics>
+
+    <!-- Physics engine -->
+
+    <plugin
+      filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+
+    <!-- Entity creation and deletion -->
+
+    <plugin
+      filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+
+    <!-- Scene updates -->
+
+    <plugin
+      filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+
+    <!-- Lighting -->
+
+    <light name="sun" type="directional">
+
+      <pose>0 0 10 0 0 0</pose>
+
+      <cast_shadows>true</cast_shadows>
+
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+
+      <specular>0.2 0.2 0.2 1</specular>
+
+      <direction>-0.5 0.1 -0.9</direction>
+
+    </light>
+
+    <!-- Ground -->
+
+    <model name="ground_plane">
+
+      <static>true</static>
+
+      <link name="link">
+
+        <collision name="collision">
+
+          <geometry>
+
+            <plane>
+
+              <normal>0 0 1</normal>
+
+              <size>100 100</size>
+
+            </plane>
+
+          </geometry>
+
+        </collision>
+
+        <visual name="visual">
+
+          <geometry>
+
+            <plane>
+
+              <normal>0 0 1</normal>
+
+              <size>100 100</size>
+
+            </plane>
+
+          </geometry>
+
+        </visual>
+
+      </link>
+
+    </model>
+
+  </world>
+
+</sdf>
+```
+
+This is a minimal physics world.
+
+We will add tables, objects and other robots later.
+
+---
+
+# PART G — Robot1 ROS workspace
+
+## 16\. Create the bringup package
+
+Create:
+
+text
+
+```text
+robots/so101/ros2_ws/src/so101_bringup/
+```
+
+The package will contain:
+
+text
+
+```text
+so101_bringup/
+│
+├── CMakeLists.txt
+├── package.xml
+│
+├── launch/
+│   └── simulation.launch.py
+│
+└── config/
+    └── gazebo_bridge.yaml
+```
+
+Create directories:
 
 bash
 
 ```bash
-gz sim --versions
+mkdir -p robots/so101/ros2_ws/src/so101_bringup/launch
+
+mkdir -p robots/so101/ros2_ws/src/so101_bringup/config
 ```
 
-## Test 2: ROS 2
+## 17\. package.xml
+
+**Path:**
+
+text
+
+```text
+robots/so101/ros2_ws/src/so101_bringup/package.xml
+```
+
+Complete file:
+
+xml
+
+```xml
+<?xml version="1.0"?>
+
+<package format="3">
+
+  <name>so101_bringup</name>
+
+  <version>0.1.0</version>
+
+  <description>
+    SO-101 Gazebo simulation bringup package.
+  </description>
+
+  <maintainer email="maintainer@example.com">
+    SO-101 Development
+  </maintainer>
+
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+
+  <exec_depend>launch_ros</exec_depend>
+
+  <exec_depend>robot_state_publisher</exec_depend>
+
+  <exec_depend>ros_gz_bridge</exec_depend>
+
+  <exec_depend>ros_gz_sim</exec_depend>
+
+  <exec_depend>rosgraph_msgs</exec_depend>
+
+  <export>
+
+    <build_type>ament_cmake</build_type>
+
+  </export>
+
+</package>
+```
+
+## 18\. CMakeLists.txt
+
+**Path:**
+
+text
+
+```text
+robots/so101/ros2_ws/src/so101_bringup/CMakeLists.txt
+```
+
+Complete file:
+
+cmake
+
+```cmake
+cmake_minimum_required(VERSION 3.8)
+
+project(so101_bringup)
+
+find_package(ament_cmake REQUIRED)
+
+install(
+    DIRECTORY
+        launch
+        config
+    DESTINATION share/${PROJECT_NAME}
+)
+
+ament_package()
+```
+
+---
+
+## 19\. Gazebo bridge configuration
+
+**Path:**
+
+text
+
+```text
+robots/so101/ros2_ws/src/so101_bringup/config/gazebo_bridge.yaml
+```
+
+Complete file:
+
+yaml
+
+```yaml
+---
+
+- ros_topic_name: "/clock"
+
+  gz_topic_name: "/clock"
+
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+
+  gz_type_name: "gz.msgs.Clock"
+
+  direction: GZ_TO_ROS
+```
+
+For now, we only bridge simulation time.
+
+We do not configure joint commands yet.
+
+The official bridge documentation supports YAML configuration with `GZ_TO_ROS` and `ROS_TO_GZ` directions.  Gazebo
+
+---
+
+## 20\. Simulation launch file
+
+**Path:**
+
+text
+
+```text
+robots/so101/ros2_ws/src/so101_bringup/launch/simulation.launch.py
+```
+
+Complete file:
+
+python
+
+```python
+import os
+
+from launch import LaunchDescription
+
+from launch.actions import TimerAction, ExecuteProcess
+
+from launch_ros.actions import Node
+
+from ament_index_python.packages import get_package_share_directory
+
+
+def generate_launch_description():
+
+    urdf_path = "/robot_assets/so101/so101_new_calib.urdf"
+
+    package_share = get_package_share_directory(
+        "so101_bringup"
+    )
+
+    bridge_config = os.path.join(
+        package_share,
+        "config",
+        "gazebo_bridge.yaml"
+    )
+
+    # -------------------------------------------------
+    # Original SO-101 URDF
+    # -------------------------------------------------
+
+    if not os.path.isfile(urdf_path):
+
+        raise FileNotFoundError(
+            f"SO-101 URDF not found: {urdf_path}"
+        )
+
+    with open(urdf_path, "r") as urdf_file:
+
+        robot_description = urdf_file.read()
+
+    # -------------------------------------------------
+    # Robot State Publisher
+    # -------------------------------------------------
+
+    robot_state_publisher = Node(
+
+        package="robot_state_publisher",
+
+        executable="robot_state_publisher",
+
+        name="robot_state_publisher",
+
+        output="screen",
+
+        parameters=[
+            {
+                "robot_description": robot_description,
+                "use_sim_time": True,
+            }
+        ],
+
+    )
+
+    # -------------------------------------------------
+    # Gazebo -> ROS clock bridge
+    # -------------------------------------------------
+
+    clock_bridge = Node(
+
+        package="ros_gz_bridge",
+
+        executable="parameter_bridge",
+
+        name="clock_bridge",
+
+        output="screen",
+
+        parameters=[
+            {
+                "config_file": bridge_config
+            }
+        ],
+
+    )
+
+    # -------------------------------------------------
+    # Spawn original URDF
+    # -------------------------------------------------
+
+    spawn_robot = ExecuteProcess(
+
+        cmd=[
+
+            "ros2",
+            "run",
+            "ros_gz_sim",
+            "create",
+
+            "-world",
+            "warehouse",
+
+            "-file",
+            urdf_path,
+
+            "-name",
+            "so101",
+
+            "-x",
+            "0",
+
+            "-y",
+            "0",
+
+            "-z",
+            "0.05",
+
+        ],
+
+        output="screen",
+
+    )
+
+    delayed_spawn = TimerAction(
+
+        period=5.0,
+
+        actions=[
+            spawn_robot
+        ]
+
+    )
+
+    return LaunchDescription([
+
+        clock_bridge,
+
+        robot_state_publisher,
+
+        delayed_spawn,
+
+    ])
+```
+
+### Important correction about URDF spawning
+
+We do not need to generate our own SDF file.
+
+The `ros_gz_sim create` utility supports spawning URDF files directly. The official Gazebo documentation describes spawning models from a file.  Gazebo+1
+
+We therefore use:
+
+bash
+
+```bash
+ros2 run ros_gz_sim create \
+    -world warehouse \
+    -file /robot_assets/so101/so101_new_calib.urdf \
+    -name so101
+```
+
+The original URDF remains untouched.
+
+**Important limitation:** this launch file publishes the robot description and requests spawning. It does not provide simulated joint controllers. We must add those separately.
+
+---
+
+# PART H — Build and validation
+
+## 21\. Validate mesh resources inside both containers
+
+The description directory is mounted into both containers:
+
+text
+
+```text
+/robot_assets/so101/
+│
+├── so101_new_calib.urdf
+├── so101_old_calib.urdf
+├── so101_new_calib.xml
+├── scene.xml
+└── assets/
+```
+
+Both startup scripts export:
+
+bash
+
+```bash
+export GZ_SIM_RESOURCE_PATH="/robot_assets/so101:${GZ_SIM_RESOURCE_PATH:-}"
+```
+
+This allows Gazebo to search the directory containing the original relative mesh references.
+
+After starting the containers, check robot1:
+
+bash
+
+```bash
+docker exec -it robot1 bash
+```
+
+Run:
+
+bash
+
+```bash
+ls -l /robot_assets/so101/so101_new_calib.urdf
+
+ls /robot_assets/so101/assets/
+```
+
+Check Gazebo:
+
+bash
+
+```bash
+docker exec -it gazebo bash
+```
+
+Run:
+
+bash
+
+```bash
+ls -l /robot_assets/so101/assets/
+```
+
+The fact that the files are mounted does not prove that Gazebo successfully resolves every mesh. Check the simulator logs after spawning.
+
+## 22\. Prepare the ROS workspace
+
+Inside robot1:
+
+bash
+
+```bash
+docker exec -it robot1 bash
+```
+
+Run:
 
 bash
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 
-ros2 doctor
+cd /home/ubuntu/ros2_ws
+
+rosdep update
+
+rosdep install \
+    --from-paths src \
+    --ignore-src \
+    -r -y
+
+colcon build --symlink-install
+
+source install/setup.bash
 ```
 
-## Test 3: Gazebo Transport
+Check:
 
 bash
 
 ```bash
-gz topic -l
-```
-
-## Test 4: ROS 2 controllers
-
-bash
-
-```bash
-ros2 control list_controllers
-```
-
-## Test 5: Robot namespaces
-
-bash
-
-```bash
-ros2 topic list | grep so101
+ros2 pkg list | grep so101
 ```
 
 Expected:
@@ -1818,236 +1658,706 @@ Expected:
 text
 
 ```text
-/so101_01/joint_states
-/so101_02/joint_states
-/so101_03/joint_states
+so101_bringup
 ```
 
-## Test 6: Gazebo communication
+## 23\. NVIDIA GPU configuration
 
-The SO-101 container should subscribe to each robot's Gazebo state topic and publish commands to its corresponding command topic.
+The postprocessor enables:
 
-Test:
+yaml
+
+```yaml
+gpus: all
+```
+
+for robot1.
+
+It also sets:
+
+yaml
+
+```yaml
+NVIDIA_VISIBLE_DEVICES: all
+NVIDIA_DRIVER_CAPABILITIES: all
+LIBGL_ALWAYS_SOFTWARE: "0"
+```
+
+On the host, verify:
 
 bash
 
 ```bash
-gz topic -l | grep so101
+nvidia-smi
 ```
 
-Then inspect a specific topic:
+Check NVIDIA Container Toolkit:
 
 bash
 
 ```bash
-gz topic -i -t /model/so101_01/joint_state
+docker run --rm --gpus all \
+    nvidia/cuda:12.8.0-base-ubuntu24.04 \
+    nvidia-smi
 ```
 
-These tests require the custom Gazebo plugin and transport client to be implemented first.
+You need a compatible NVIDIA driver and NVIDIA Container Toolkit.
+
+Also use a Docker Compose version supporting the `gpus` service property.
+
+The Gazebo server is initially CPU-based for physics. GPU access is assigned to robot1 for PyTorch.
 
 ---
 
-# 20\. Dataset recording
+# PART I — Start everything
 
-The dataset structure should preserve the environment configuration.
+## 24\. Generate Docker Compose
+
+From the project root:
+
+bash
+
+```bash
+chmod +x .devcontainer/generate_compose.sh
+
+.devcontainer/generate_compose.sh
+```
+
+Generated file:
 
 text
 
 ```text
-data/
-└── datasets/
-    └── pick_and_place_001/
-        ├── environment.json
-        ├── metadata.json
-        ├── calibration/
-        ├── images/
-        └── episodes/
+.devcontainer/ros2docker/tmp/docker-compose.yml
 ```
 
-Example metadata:
+## 25\. Inspect generated services
 
-json
+bash
 
-```json
-{
-  "task": "pick_and_place",
-
-  "robot": "so101_01",
-
-  "backend": "gazebo",
-
-  "world": "table_world",
-
-  "environment_seed": 42,
-
-  "objects": [
-    "red_cube",
-    "blue_cube",
-    "green_cylinder"
-  ],
-
-  "camera": "overhead_camera",
-
-  "ros_distro": "jazzy",
-
-  "gazebo_version": "harmonic"
-}
+```bash
+docker compose \
+    -f .devcontainer/ros2docker/tmp/docker-compose.yml \
+    config --services
 ```
 
-The environment configuration should be copied into the dataset directory whenever recording begins.
+Expected:
 
-This ensures that the exact simulation can be reproduced later.
+text
+
+```text
+gazebo
+robot1
+```
+
+Inspect mounts:
+
+bash
+
+```bash
+docker compose \
+    -f .devcontainer/ros2docker/tmp/docker-compose.yml \
+    config
+```
+
+Verify:
+
+- Gazebo does not mount the SO-101 ROS workspace.
+- Robot1 mounts the complete workspace.
+- Both mount the original description.
+- Robot1 has independent build/install/log volumes.
+- GPU access is enabled for robot1.
+- noVNC ports are bound to localhost.
+- The top-level named volumes still exist.
+
+## 26\. Build the containers
+
+bash
+
+```bash
+docker compose \
+    -f .devcontainer/ros2docker/tmp/docker-compose.yml \
+    build
+```
+
+## 27\. Start the containers
+
+bash
+
+```bash
+docker compose \
+    -f .devcontainer/ros2docker/tmp/docker-compose.yml \
+    up -d
+```
+
+Check:
+
+bash
+
+```bash
+docker ps
+```
+
+Expected:
+
+text
+
+```text
+gazebo
+robot1
+```
+
+## 28\. Inspect Gazebo
+
+bash
+
+```bash
+docker logs -f gazebo
+```
+
+Expected:
+
+- Gazebo executable found.
+- World loaded.
+- Physics system initialized.
+- Scene broadcaster initialized.
+
+## 29\. Access robot1
+
+bash
+
+```bash
+docker exec -it robot1 bash
+```
+
+Source the workspace:
+
+bash
+
+```bash
+source /opt/ros/jazzy/setup.bash
+
+source /home/ubuntu/ros2_ws/install/setup.bash
+```
+
+Start the simulation:
+
+bash
+
+```bash
+ros2 launch so101_bringup simulation.launch.py
+```
+
+The launch file will:
+
+1. Start the clock bridge.
+2. Start `robot_state_publisher`.
+3. Wait five seconds.
+4. Request the original SO-101 URDF to be spawned in Gazebo.
+
+The five-second delay is only a basic startup allowance. If Gazebo is not ready, spawning can fail; in that case retry the spawn command after confirming the world is running.
+
+## 30\. Check Gazebo Transport
+
+Inside Gazebo:
+
+bash
+
+```bash
+gz topic -l
+```
+
+Inside robot1:
+
+bash
+
+```bash
+gz topic -l
+```
+
+Both containers must discover the same Gazebo partition and relevant simulation topics.
+
+The generated Compose file currently sets:
+
+yaml
+
+```yaml
+GZ_PARTITION: ros2_gz_partition
+```
+
+for both services.
+
+If discovery does not work over the Docker bridge network, configure a Gazebo Transport Discovery Server or use an alternative networking configuration. Do not attempt to solve this by putting the containers in the same ROS domain.
+
+## 31\. Check ROS topics
+
+Inside robot1:
+
+bash
+
+```bash
+ros2 topic list
+```
+
+Check the simulation clock:
+
+bash
+
+```bash
+ros2 topic echo /clock
+```
+
+Check joint states:
+
+bash
+
+```bash
+ros2 topic list | grep joint_states
+```
+
+At this stage, a working `/clock` bridge is expected.
+
+**Do not expect working****`/joint_states`****yet.** We have not added a Gazebo joint-state publisher system.
 
 ---
 
-# 21\. Final implementation priorities
+# PART J — LeRobot and PyTorch
 
-| Milestone | Deliverable | Status |
-| --- | --- | --- |
-| 01 | ros2docker bug fixes | Pending complete patch |
-| 02 | Docker infrastructure | Starter configuration provided |
-| 03 | Dynamic Gazebo world | Initial generator provided |
-| 04 | SO-101 Gazebo model | Pending |
-| 05 | Gazebo C++ plugin | Pending |
-| 06 | ROS 2 hardware interface | Interface design provided |
-| 07 | Feetech physical backend | Pending |
-| 08 | LeRobot adapter | Interface design provided |
-| 09 | Multi-robot support | Architecture defined |
-| 10 | MoveIt 2 integration | Pending |
-| 11 | RViz2 integration | Pending |
-| 12 | Dataset recording | Architecture defined |
-| 13 | Integration tests | Pending |
+## 32\. Install LeRobot in robot1
 
-# 22\. Important technical requirements before production
+We keep Python dependencies separate from the ROS system Python.
 
-There are several components that must be completed before this becomes a working robotics platform.
+Inside robot1:
 
-### A. SO-101 model
+bash
 
-Use the official LeRobot SO-101 robot description as the starting point.
+```bash
+python3 -m venv ~/lerobot_venv
 
-https://github.com/huggingface/lerobot
+source ~/lerobot_venv/bin/activate
 
-The model must include:
+pip install --upgrade pip
 
-- Five arm joints.
-- One gripper joint.
-- Correct joint limits.
-- Visual meshes.
-- Collision meshes.
-- Inertial parameters.
-- Gazebo-compatible transmissions or plugin interfaces.
+pip install lerobot
+```
 
-### B. Gazebo plugin
+Install the appropriate CUDA-enabled PyTorch build using the official selector:
 
-The custom Gazebo plugin must:
+[PyTorch installation selector](<https://pytorch.org/get-started/locally/?utm_source=chatgpt.com>)
 
-- Discover SO-101 models.
-- Identify robots by model name.
-- Publish joint states.
-- Receive joint commands.
-- Support multiple independent robots.
-- Maintain independent command and state topics.
+Then verify:
 
-### C. ROS 2 hardware interface
+bash
 
-The C++ hardware interface must:
+```bash
+python3 -c \
+'import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU")'
+```
 
-- Implement `SystemInterface`.
-- Connect to Gazebo Transport.
-- Export the six joint interfaces.
-- Handle communication timeouts.
-- Support multiple instances.
-- Allow switching between simulation and physical hardware.
+Expected:
 
-### D. LeRobot
+text
 
-The Python adapter must use the actual LeRobot robot interface for the selected version.
+```text
+True
+NVIDIA ...
+```
 
-It must support:
+Your LeRobot data directory is:
 
-- Teleoperation.
-- Observation retrieval.
-- Action execution.
-- Camera images.
-- Dataset recording.
-- Policy inference.
+text
 
-### E. Network isolation
+```text
+/data/lerobot/
+```
 
-The ROS 2 DDS domain and Gazebo Transport partition are separate settings.
+Inside the container:
+
+bash
+
+```bash
+mkdir -p /data/lerobot
+```
+
+Official project:
+
+[LeRobot documentation and repository](<https://github.com/huggingface/lerobot?utm_source=chatgpt.com>)
+
+---
+
+# PART K — Git and documentation
+
+## 33\. .gitignore
+
+**Path:**
+
+text
+
+```text
+.gitignore
+```
+
+Complete file:
+
+gitignore
+
+```gitignore
+# ROS 2
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# LeRobot datasets
+data/lerobot/
+
+# HuggingFace
+.cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Generated ros2docker files
+.devcontainer/ros2docker/tmp/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+```
+
+Do not ignore:
+
+text
+
+```text
+.devcontainer/ros2docker/
+```
+
+It is a Git submodule.
+
+## 34\. README.md
+
+**Path:**
+
+text
+
+```text
+README.md
+```
+
+Complete file:
+
+markdown
+
+```markdown
+# SO-101 LeRobot Multicontainer
+
+Docker-based development environment for the SO-101 robot.
+
+## System
+
+- Ubuntu 24.04
+- NVIDIA GPU
+- ROS 2 Jazzy
+- Gazebo Harmonic
+- LeRobot
+- PyTorch
+- MoveIt 2
+- ros2_control
+
+## Architecture
+
+Two independent containers.
+
+### Gazebo
+
+- Gazebo Harmonic
+- Physics simulation
+- Simulation worlds
+- Robot spawning
+- Gazebo Transport
+
+### Robot1
+
+- ROS 2 Jazzy
+- SO-101 ROS workspace
+- ros_gz_bridge
+- RViz2
+- MoveIt
+- ros2_control
+- LeRobot
+- PyTorch
+
+## Communication
+
+Gazebo and robot1 communicate through Gazebo Transport.
+
+The ros_gz_bridge runs in robot1.
+
+The ROS 2 domains are separate.
+
+## Original robot description
+
+The SO-101 description is downloaded from:
+
+https://github.com/TheRobotStudio/SO-ARM100
+
+The original new-calibration URDF is used.
+
+## Initialize submodules
+
+    git submodule update --init --recursive
+
+## Generate Compose
+
+    .devcontainer/generate_compose.sh
+
+## Build
+
+    docker compose \
+      -f .devcontainer/ros2docker/tmp/docker-compose.yml \
+      build
+
+## Start
+
+    docker compose \
+      -f .devcontainer/ros2docker/tmp/docker-compose.yml \
+      up -d
+
+## Enter Gazebo
+
+    docker exec -it gazebo bash
+
+## Enter robot1
+
+    docker exec -it robot1 bash
+
+## Build ROS workspace
+
+    source /opt/ros/jazzy/setup.bash
+
+    cd /home/ubuntu/ros2_ws
+
+    rosdep install \
+      --from-paths src \
+      --ignore-src \
+      -r -y
+
+    colcon build --symlink-install
+
+    source install/setup.bash
+
+## Launch simulation
+
+    ros2 launch so101_bringup simulation.launch.py
+
+## Stop containers
+
+    docker compose \
+      -f .devcontainer/ros2docker/tmp/docker-compose.yml \
+      down
+```
+
+# PART L — What is implemented and what comes next
+
+## 35\. Current implementation versus future work
+
+There is an important distinction between spawning the robot and controlling it.
+
+The original SO-101 URDF provides:
+
+- Link geometry.
+- Collision geometry.
+- Inertial properties.
+- Joint definitions.
+- Joint limits.
+- Transmission descriptions.
+
+It does not provide a complete Gazebo control integration.
+
+Therefore, the current implementation provides the following:
+
+| Feature | Status |
+| --- | --- |
+| Two independent containers | Configured |
+| Gazebo Harmonic installation | Configured |
+| Gazebo world | Implemented |
+| Original SO-101 URDF | Reused |
+| Original mesh assets | Mounted |
+| URDF spawning | Configured |
+| ROS 2 robot description | Configured |
+| Gazebo-to-ROS clock bridge | Configured |
+| NVIDIA access for robot1 | Configured |
+| LeRobot installation | Manual installation |
+| Joint-state feedback | Not implemented |
+| Joint position controllers | Not implemented |
+| ros2\_control hardware integration | Not implemented |
+| MoveIt configuration | Not implemented |
+
+These files are an implementation starting point, not a verified running system. In particular, validate the original URDF's mesh resolution and spawning against your actual Gazebo image before proceeding.
+
+## 36\. Next development phases
+
+I recommend implementing the remaining functionality in this order.
+
+### Phase 1 — Simulation
+
+text
+
+```text
+Gazebo
+  |
+  +-- World
+  |
+  +-- SO-101 URDF
+  |
+  +-- Physics
+  |
+  +-- Robot spawning
+```
+
+### Phase 2 — Joint feedback
+
+Add Gazebo's:
+
+text
+
+```text
+JointStatePublisher
+```
+
+Bridge joint feedback into robot1:
+
+text
+
+```text
+Gazebo
+   |
+   | Gazebo Transport
+   v
+ros_gz_bridge
+   |
+   | ROS 2
+   v
+/joint_states
+```
+
+### Phase 3 — Joint commands
+
+Add Gazebo native joint controllers.
 
 For example:
 
-bash
+text
 
-```bash
-ROS_DOMAIN_ID=10
-GZ_PARTITION=so101_simulation
+```text
+ROS 2 Controller
+       |
+       v
+ros_gz_bridge
+       |
+       | Gazebo Transport
+       v
+Gazebo Joint Controller
+       |
+       v
+SO-101
 ```
 
-Changing `ROS_DOMAIN_ID` must not prevent the SO-101 hardware interface from communicating with Gazebo.
+Relevant documentation:
+
+- [Gazebo JointPositionController](<https://gazebosim.org/api/sim/10/classgz_1_1sim_1_1systems_1_1JointPositionController.html?utm_source=chatgpt.com>)
+- [Gazebo JointStatePublisher](<https://gazebosim.org/api/sim/10/classgz_1_1sim_1_1systems_1_1JointStatePublisher.html?utm_source=chatgpt.com>)
+
+### Phase 4 — ros2\_control
+
+Configure the SO-101 hardware interface in robot1.
+
+One architectural decision remains: whether to use Gazebo's `gz_ros2_control` plugin or a custom Gazebo Transport hardware interface.
+
+For your strict container separation, I would investigate the second option first.
+
+### Phase 5 — MoveIt
+
+Add:
+
+text
+
+```text
+robots/so101/ros2_ws/src/
+    so101_moveit_config/
+```
+
+Use the original SO-101 joint names and geometry.
+
+### Phase 6 — LeRobot
+
+Connect the LeRobot policy to the ROS 2 control interface.
+
+Eventually:
+
+text
+
+```text
+              LeRobot
+                 |
+                 v
+          ROS 2 Controller
+                 |
+                 v
+            ros_gz_bridge
+                 |
+                 v
+              Gazebo
+                 |
+                 v
+              SO-101
+```
 
 ---
 
-# 23\. Final project goals
+## 37\. Important references
 
-The final system should allow you to do something like:
-
-bash
-
-```bash
-# Generate a new environment
-python3 tools/generate_world.py \
-    --config experiments/pick_and_place.json
-
-# Start simulation
-docker compose up -d
-
-# Launch robot controllers
-ros2 launch so101_bringup simulation.launch.py \
-    robot_name:=so101_01
-
-# Start LeRobot
-python3 lerobot/teleoperate.py \
-    --robot so101_01
-```
-
-Then change the environment:
-
-bash
-
-```bash
-python3 tools/generate_world.py \
-    --config experiments/stacking.json
-
-docker compose restart gazebo
-```
-
-The same SO-101 ROS 2 and LeRobot installation should work with the new world.
+| Component | Documentation |
+| --- | --- |
+| ros2docker | [GitHub repository](<https://github.com/DavideCapuzz/ros2docker?utm_source=chatgpt.com>) |
+| SO-ARM100/SO-101 | [GitHub repository](<https://github.com/TheRobotStudio/SO-ARM100?utm_source=chatgpt.com>) |
+| Gazebo Harmonic | [Gazebo documentation](<https://gazebosim.org/docs/harmonic/?utm_source=chatgpt.com>) |
+| ROS-Gazebo integration | [ROS-Gazebo documentation](<https://gazebosim.org/docs/harmonic/ros2_integration/?utm_source=chatgpt.com>) |
+| ros\_gz\_bridge | [Bridge documentation](<https://github.com/gazebosim/ros_gz/blob/ros2/ros_gz_bridge/README.md?utm_source=chatgpt.com>) |
+| ros2\_control | [ros2\_control documentation](<https://control.ros.org/jazzy/index.html?utm_source=chatgpt.com>) |
+| MoveIt 2 | [MoveIt documentation](<https://moveit.picknik.ai/main/index.html?utm_source=chatgpt.com>) |
+| LeRobot | [LeRobot repository](<https://github.com/huggingface/lerobot?utm_source=chatgpt.com>) |
 
 ---
 
-# 24\. What I recommend implementing first
+## 38\. Final design principles
 
-The most important next milestone is **01 — ros2docker\_fixed**.
+The architecture deliberately follows these rules:
 
-I would not start implementing MoveIt or LeRobot policies before establishing that:
+1. Do not modify the original SO-101 URDF.
+2. Do not duplicate robot geometry.
+3. Do not put the SO-101 ROS workspace inside Gazebo.
+4. Do not put Gazebo-specific robot controllers inside the original model repository.
+5. Keep `ros_gz_bridge` inside robot1.
+6. Use Gazebo Transport between containers.
+7. Keep ROS 2 DDS domains separate between containers.
+8. Preserve ros2docker's original naming convention.
+9. Preserve independent build/install/log volumes.
+10. Add future functionality through separate ROS packages.
 
-1. Both containers build.
-2. Gazebo starts.
-3. Gazebo Transport works across containers.
-4. A robot can be spawned.
-5. ROS 2 receives its joint states.
-6. ROS 2 can command its joints.
-7. Two robots can operate independently.
+**One final point about ros2docker:** use the previously bug-fixed copy of the submodule as your starting point. The only additional ros2docker source-file replacement in this implementation is `scripts/init_setup.sh`; the Compose generator itself remains unchanged.
 
-Once these seven tests pass, the foundation is ready for LeRobot integration.
+This gives you a relatively clean foundation for adding robot2, robot3 and additional simulators later without redesigning the container architecture.
 
-**Important:** This Markdown document is the complete project specification and starter implementation supplied so far, not a tested release. Several critical source files, particularly the SO-101 model, Gazebo plugin and C++ hardware interface, still need implementation.
-
-You can save everything above as:
-
-`SO101_Gazebo_Project.md`
-
-I recommend keeping this document as the project's main technical specification and updating it with every completed milestone.
+:::
